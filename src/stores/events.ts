@@ -1,0 +1,722 @@
+import { create } from "zustand"
+import { useConnections } from "./connections"
+import { useSessions, abortedSessions } from "./sessions"
+import { send as notify } from "../lib/notifications"
+import { sanitizeBody } from "../lib/notify-format"
+import { statusFromPart } from "../lib/status-labels"
+import { addBreadcrumb } from "../lib/sentry"
+import { AnalyticsEvent, track } from "../lib/analytics"
+import { recordSuccessfulSession } from "../lib/store-review"
+import { isAuthError } from "../lib/api-error"
+import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
+import { AppState } from "react-native"
+import * as Network from "expo-network"
+import { mergePendingPermissions, normalizePendingPermission, normalizePermissionEvent, type PendingPermission } from "../lib/permissions"
+import { SSE_DIAL_TIMEOUT_MS, SSE_LIVENESS_EVENT_TYPE, SSE_STALE_LIVE_MS } from "../lib/sse"
+import type { Client, Part, Session, Message } from "../lib/sdk"
+
+// Session status from the server
+type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
+
+// Transport liveness, distinct from "a connection is selected" (#186).
+// `connected` flips only when a byte actually arrives on the stream; the
+// finer distinction lives here so the UI can't show green over a stream that
+// never delivered anything.
+export type TransportState =
+  /** No attempt in flight and nothing live. */
+  | "idle"
+  /** Attempting; nothing received yet. NOT the same as connected. */
+  | "connecting"
+  /** At least one event received on this attempt. */
+  | "live"
+
+interface EventsState {
+  connected: boolean
+  transport: TransportState
+  // Set when the last connection attempt failed with 401/403 — the server
+  // rejected our credentials, not a transient network issue. The reconnect
+  // loop stops retrying in this case (see connect()) since hammering a
+  // fixed-credential auth failure forever just spams Sentry/battery with no
+  // path to recovery (issue #76). Cleared on the next connect() attempt,
+  // e.g. after the user fixes their credentials on the connection edit screen.
+  authError: boolean
+  reconnectAttempts: number
+  lastDisconnectAt: number | null
+  // Last SSE disconnect reason as a short display string (issue #214 AF-4):
+  // shown as the second line of the reconnect banner so the user sees *why*
+  // the stream dropped, not just the attempt count. Set when a reconnect is
+  // scheduled, cleared once the stream proves live again.
+  lastDisconnectReason: string | null
+  sessionStatus: Record<string, SessionStatus>
+  statusText: Record<string, string>
+  // Last error message per session id, set on session.error for ANY session
+  // (unlike the viewed-session-only banner) so the subagent surface (#187)
+  // can show a Failed row for a child the user never opened. Cleared when
+  // the session next goes busy. Kept separate from erroredSessions, which
+  // drives notification/review logic and stays untouched.
+  sessionErrors: Record<string, string>
+  // Permissions & questions (pending per session)
+  permissions: Record<string, PendingPermission[]>
+  questions: Record<
+    string,
+    Array<{
+      id: string
+      sessionID: string
+      questions: Array<{
+        question: string
+        header: string
+        options: Array<{ label: string; description: string }>
+        multiple?: boolean
+        custom?: boolean
+      }>
+      tool?: { messageID: string; callID: string }
+    }>
+  >
+
+  connect: () => void
+  disconnect: () => void
+  // Force an immediate reconnect + full resync, bypassing the backoff loop.
+  // Called when the app returns to the foreground: Android freezes JS timers
+  // and usually kills the SSE socket while backgrounded, so the backoff
+  // timers that were scheduled never ran and the stream is stale.
+  reconnectNow: () => void
+}
+
+let controller: AbortController | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+// True while a connect() attempt's stream loop is running. reconnectNow()
+// (the single resume entry point) no-ops while this is set, so a foreground
+// event racing a network-restore event cannot open a second stream. Guarded
+// by attemptToken: connect() bumps the token, and a stale loop's finally only
+// clears the flag when its token is still current — otherwise aborting an old
+// attempt would clear the flag out from under the new one.
+let attemptInFlight = false
+let attemptToken = 0
+// Wall-clock time a byte last arrived on the current attempt (any yielded
+// event — liveness-only included). Lets reconnectNow() tell a stale-live
+// half-open stream from a fresh one (Finding 3).
+let lastByteAt: number | null = null
+// When the current attempt started dialling. Lets reconnectNow() rescue an
+// attempt parked in a hung dial beyond the dial bound (Finding 2).
+let attemptStartedAt: number | null = null
+
+// Sessions that emitted session.error since they last went busy. SessionStatus
+// has no error variant — an errored session still ends with a busy -> idle
+// transition — so without this mark an errored run would count as a success
+// toward the once-ever store review prompt.
+const erroredSessions = new Set<string>()
+
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000] as const
+const PROLONGED_DISCONNECT_MS = 30_000
+
+// Short display form of an SSE disconnect reason for the reconnect banner
+// (issue #214 AF-4). Errors stringify as "Error: <message>" — drop the
+// redundant prefix so the banner reads like the design's example
+// ("SSE stream closed (code 1006)"), and cap the length so a verbose
+// transport error can't blow out the banner.
+function disconnectReasonText(reason: unknown): string {
+  return String(reason).replace(/^Error:\s*/, "").slice(0, 200)
+}
+
+// Re-fetch pending permissions and questions from the server for a session.
+// Called when entering a session to recover from missed SSE events or failed
+// optimistic removals.
+export async function refreshPending(client: Client, sessionID: string) {
+  try {
+    // v2 permission/form lists are session-scoped — pass the session so
+    // pending prompts are found regardless of the server's active location.
+    const [perms, questions] = await Promise.all([client.permission.list(sessionID), client.question.list(sessionID)])
+    const sessionPerms = (perms || []).map(normalizePendingPermission).filter((p): p is PendingPermission => !!p && p.sessionID === sessionID)
+    const sessionQuestions = (questions || []).filter((q: Record<string, unknown>) => q.sessionID === sessionID)
+    useEvents.setState((state) => ({
+      permissions: { ...state.permissions, [sessionID]: mergePendingPermissions([], sessionPerms) },
+      questions: { ...state.questions, [sessionID]: sessionQuestions as any },
+    }))
+  } catch (err) {
+    console.warn("[Events] Failed to refresh pending:", err)
+  }
+}
+
+async function refreshAllPending() {
+  const connectionState = useConnections.getState()
+  const clients = new Set<Client>()
+  if (connectionState.client) clients.add(connectionState.client)
+  for (const session of useSessions.getState().sessions) {
+    if (!session.directory) continue
+    const client = connectionState.clientForDirectory(session.directory)
+    if (client) clients.add(client)
+  }
+  await Promise.all([...clients].map(async (client) => {
+    try {
+      const pending = await client.permission.list()
+      const grouped = new Map<string, PendingPermission[]>()
+      for (const value of pending || []) {
+        const normalized = normalizePendingPermission(value)
+        if (normalized) grouped.set(normalized.sessionID, [...(grouped.get(normalized.sessionID) || []), normalized])
+      }
+      useEvents.setState((state) => {
+        const permissions = { ...state.permissions }
+        for (const [sessionID, items] of grouped) permissions[sessionID] = mergePendingPermissions(permissions[sessionID] || [], items)
+        return { permissions }
+      })
+    } catch (err) {
+      console.warn("[Events] Failed to reconcile pending permissions:", err)
+    }
+  }))
+}
+
+// Re-sync any session currently marked "busy" against the server after an
+// SSE reconnect. sessionStatus/sending are SSE-driven and there is normally
+// no other path to idle — if the server's busy -> idle `session.status`
+// event fired while the network was down, SSE reconnect resumes the stream
+// from "now" (it does not replay missed events), so without this the busy
+// flag would never clear and the UI would show a stuck 'processing' spinner
+// forever (issue #123).
+//
+// Only ever CLEARS a busy flag the server confirms is stale via
+// isSessionActuallyIdle — it never marks a session busy, so it can't
+// clobber a genuinely still-busy session. Also re-checks sessionStatus right
+// before writing, so a real session.status event that lands while the fetch
+// is in flight (e.g. the session went busy again) wins over this resync.
+async function resyncBusySessions() {
+  const busySessionIDs = Object.entries(useEvents.getState().sessionStatus)
+    .filter(([, status]) => status.type === "busy")
+    .map(([sessionID]) => sessionID)
+  if (busySessionIDs.length === 0) return
+
+  await Promise.all(
+    busySessionIDs.map(async (sessionID) => {
+      try {
+        const sessionsState = useSessions.getState()
+        const session =
+          sessionsState.sessions.find((s) => s.id === sessionID) ??
+          (sessionsState.currentSession?.id === sessionID ? sessionsState.currentSession : undefined)
+        const connState = useConnections.getState()
+        const client = session?.directory
+          ? connState.clientForDirectory(session.directory) ?? connState.client
+          : connState.client
+        if (!client) return
+
+        const response = await client.session.messages(sessionID)
+        const messages = (response || []).map((m) => m.info)
+        if (!isSessionActuallyIdle(messages)) return // server says still busy - leave it alone
+
+        // A fresh session.status event may have landed on the SSE stream
+        // while this fetch was in flight — that's authoritative, don't
+        // stomp on it.
+        if (useEvents.getState().sessionStatus[sessionID]?.type !== "busy") return
+
+        useEvents.setState((state) => ({
+          sessionStatus: { ...state.sessionStatus, [sessionID]: { type: "idle" } },
+          statusText: { ...state.statusText, [sessionID]: "" },
+        }))
+        useSessions.setState((state) => ({ sending: { ...state.sending, [sessionID]: false } }))
+        if (useSessions.getState().currentSession?.id === sessionID) {
+          useSessions.getState().refreshMessages()
+        }
+      } catch (err) {
+        console.warn("[Events] Failed to resync session status for", sessionID, err)
+      }
+    }),
+  )
+}
+
+export const useEvents = create<EventsState>((set, get) => ({
+  connected: false,
+  transport: "idle",
+  authError: false,
+  reconnectAttempts: 0,
+  lastDisconnectAt: null,
+  lastDisconnectReason: null,
+  sessionStatus: {},
+  statusText: {},
+  sessionErrors: {},
+  permissions: {},
+  questions: {},
+
+  connect: () => {
+    controller?.abort()
+    controller = null
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+
+    const client = useConnections.getState().client
+    if (!client) return
+
+    controller = new AbortController()
+    const currentController = controller
+    const token = ++attemptToken
+    attemptInFlight = true
+    attemptStartedAt = Date.now()
+    lastByteAt = null
+    // `connected` is NOT set here: it flips only on the first received
+    // evidence below, so "connecting" never reads as live (#186). It IS
+    // cleared here, so a re-entry (manual Retry) cannot leave a stale
+    // `connected: true` behind while the transport is "connecting" (LOW 5).
+    set({ connected: false, transport: "connecting", authError: false })
+    console.log("[SSE] Connecting to event stream...")
+    addBreadcrumb({ category: "sse", message: "connecting" })
+
+    // Run in background
+    ;(async () => {
+      let reconnectScheduled = false
+      // True if this connect() call is resuming after a prior disconnect —
+      // gates the one-time busy-session resync below so a cold app start
+      // (sessionStatus is always empty then) never triggers it, and a run of
+      // failed retries can't re-arm the check on every attempt.
+      const isReconnect = get().reconnectAttempts > 0
+      let resyncedAfterReconnect = false
+      // True once this attempt has demonstrated liveness. The backoff reset
+      // below keys off this, not a timer: a silently-failing connection used
+      // to clear its own backoff after 10s whether or not anything arrived.
+      // The SDK yields an `sse.liveness` event for heartbeat-only chunks,
+      // so a healthy but idle server demonstrates liveness without any
+      // session event (Finding 1); the idle watchdog already treats any
+      // bytes on the wire as liveness at the transport layer.
+      let sawLiveness = false
+
+      const scheduleReconnect = (reason: unknown) => {
+        if (reconnectScheduled || currentController.signal.aborted) return
+        reconnectScheduled = true
+        const state = get()
+        const reconnectAttempts = state.reconnectAttempts + 1
+        const lastDisconnectAt = state.lastDisconnectAt ?? Date.now()
+        const disconnectedFor = Date.now() - lastDisconnectAt
+        set({ connected: false, transport: "connecting", reconnectAttempts, lastDisconnectAt, lastDisconnectReason: disconnectReasonText(reason) })
+
+        if (disconnectedFor >= PROLONGED_DISCONNECT_MS) {
+          notify({
+            category: "connection",
+            title: "Connection interrupted",
+            body: sanitizeBody(undefined, "Trying to reconnect to your server"),
+            sessionId: "",
+            dedupeKey: "sse-prolonged-disconnect",
+            dedupeCooldownMs: 60_000,
+          })
+        }
+
+        const baseDelay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts - 1, RECONNECT_DELAYS_MS.length - 1)]
+        const jitteredDelay = Math.min(15_000, Math.round(baseDelay * (0.75 + Math.random() * 0.5)))
+        console.warn(`[SSE] Connection lost, reconnecting in ${jitteredDelay}ms:`, reason)
+        addBreadcrumb({
+          category: "sse",
+          level: "warning",
+          message: "reconnect scheduled",
+          data: { attempt: reconnectAttempts, delayMs: jitteredDelay, reason: String(reason).slice(0, 200) },
+        })
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null
+          get().connect()
+        }, jitteredDelay)
+      }
+
+      try {
+        for await (const event of client.global.events(currentController.signal)) {
+          if (currentController.signal.aborted) break
+
+          const payload = (event as any).payload || event
+          const type = payload.type as string
+          // Any yielded event — liveness-only or session — is proof of
+          // bytes on the wire. Record it first: reconnectNow() keys its
+          // stale-live rescue off this timestamp.
+          lastByteAt = Date.now()
+
+          // First byte of evidence: the stream is genuinely live, not just
+          // dialled. This flips `connected`, marks the transport live, and
+          // resets the backoff — the only reset path (no timer).
+          if (!sawLiveness) {
+            sawLiveness = true
+            set({ connected: true, transport: "live", reconnectAttempts: 0, lastDisconnectAt: null, lastDisconnectReason: null })
+          }
+
+          // The stream is genuinely live again (we're actually receiving
+          // data, not just optimistically marked "connected") — resync once
+          // per reconnect, not on every event. Runs on quiet reconnects
+          // too: liveness events reach this point, so no session event is
+          // needed to trigger the resync (Finding 1).
+          if (isReconnect && !resyncedAfterReconnect) {
+            resyncedAfterReconnect = true
+            void resyncBusySessions()
+            void refreshAllPending()
+          }
+
+          // Liveness-only: no session payload to dispatch.
+          if (type === SSE_LIVENESS_EVENT_TYPE) continue
+
+          const props = payload.properties || {}
+
+          switch (type) {
+            case "session.status": {
+              const sessionID = props.sessionID as string
+              const status = props.status as SessionStatus
+              if (!sessionID) break
+
+              // Detect busy → idle transition for completion notification
+              const previous = get().sessionStatus[sessionID]
+              const completed = previous?.type === "busy" && status.type === "idle"
+
+              // A new run starts — forget any error/abort from the previous one
+              if (status.type === "busy") {
+                erroredSessions.delete(sessionID)
+                abortedSessions.delete(sessionID)
+              }
+
+              set((state) => {
+                const sessionErrors =
+                  status.type === "busy" && state.sessionErrors[sessionID]
+                    ? Object.fromEntries(Object.entries(state.sessionErrors).filter(([id]) => id !== sessionID))
+                    : state.sessionErrors
+                return {
+                  sessionStatus: { ...state.sessionStatus, [sessionID]: status },
+                  // Clear status text when idle
+                  statusText: status.type === "idle" ? { ...state.statusText, [sessionID]: "" } : state.statusText,
+                  sessionErrors,
+                }
+              })
+
+              // SSE is the source of truth — update sending state unconditionally
+              if (status.type === "idle") {
+                useSessions.setState((state) => ({
+                  sending: { ...state.sending, [sessionID]: false },
+                }))
+                // Refresh messages if this is the session the user is viewing
+                const sessions = useSessions.getState()
+                if (sessions.currentSession?.id === sessionID) {
+                  sessions.refreshMessages()
+                }
+              }
+
+              if (completed) {
+                // A user-cancelled run still ends busy -> idle; don't count it
+                // as a received response or a review-worthy success.
+                const aborted = abortedSessions.has(sessionID)
+                if (!aborted) track(AnalyticsEvent.ResponseReceived)
+                // Only notify "Task completed" for a genuine completion — a
+                // user-cancelled run didn't complete, and an errored run
+                // already fired its own "Session error" notification (session.error
+                // doesn't touch sessionStatus, so an errored session still lands
+                // here via busy→idle). Without this guard the user gets a
+                // misleading — or duplicate, contradictory — completion push.
+                if (!aborted && !erroredSessions.has(sessionID)) {
+                  const match = useSessions.getState().sessions.find((s) => s.id === sessionID)
+                  notify({
+                    category: "completed",
+                    title: "Task completed",
+                    body: sanitizeBody(match?.title, "Session finished processing"),
+                    sessionId: sessionID,
+                  })
+                }
+                // Genuinely positive moment — count it toward the one-time
+                // store review prompt, but only if this run never errored
+                // (session.error doesn't touch sessionStatus, so an errored
+                // session still lands here via busy -> idle) and wasn't aborted.
+                if (!aborted && !erroredSessions.has(sessionID)) void recordSuccessfulSession()
+              }
+              break
+            }
+
+            case "message.updated": {
+              const info = props.info as Message | undefined
+              if (!info) break
+              useSessions.getState().handleEvent({ type, properties: { info } } as any)
+              break
+            }
+
+            case "message.part.updated": {
+              const part = props.part as Part | undefined
+              if (!part) break
+
+              // Update status text from the latest part
+              const sessionID = (part as any).sessionID as string
+              if (sessionID) {
+                set((state) => ({
+                  statusText: { ...state.statusText, [sessionID]: statusFromPart(part) },
+                }))
+              }
+
+              useSessions.getState().handleEvent({ type, properties: { part } } as any)
+              break
+            }
+
+            case "session.updated": {
+              const info = props.info as Session | undefined
+              if (!info) break
+              useSessions.getState().handleEvent({ type, properties: { info } } as any)
+              break
+            }
+
+            case "session.created": {
+              const info = props.info as Session | undefined
+              if (!info) break
+              // #187 (AC3): route on parentID — a child must never reach the
+              // root list. Roots prepend exactly as before; children upsert
+              // into childrenByParent ONLY if that parent's key already
+              // exists (its section already loaded); otherwise ignore — the
+              // next loadChildren fetch picks the child up.
+              if (info.parentID) {
+                useSessions.setState((state) => {
+                  const existing = state.childrenByParent[info.parentID as string]
+                  if (!existing) return {}
+                  if (existing.some((s) => s.id === info.id)) return {}
+                  return {
+                    childrenByParent: {
+                      ...state.childrenByParent,
+                      [info.parentID as string]: [info, ...existing],
+                    },
+                  }
+                })
+                break
+              }
+              useSessions.setState((state) => {
+                const exists = state.sessions.some((s) => s.id === info.id)
+                if (exists) return {}
+                return { sessions: [info, ...state.sessions] }
+              })
+              break
+            }
+
+            case "session.error": {
+              const error = props.error as { message?: string } | undefined
+              const sessionID = props.sessionID as string
+              if (!sessionID) break
+              // Mark so the eventual busy -> idle transition is not counted
+              // as a success for the store review prompt
+              erroredSessions.add(sessionID)
+              // #187 (AC4): record the message for any session id so a child
+              // row can show Failed with the server message. Notification and
+              // viewed-session banner behaviour below are unchanged.
+              set((state) => ({
+                sessionErrors: { ...state.sessionErrors, [sessionID]: error?.message || "Session error occurred" },
+              }))
+              // Clear sending state unconditionally — SSE is truth
+              useSessions.setState((state) => ({
+                sending: { ...state.sending, [sessionID]: false },
+                // Surface error only if user is viewing this session
+                ...(state.currentSession?.id === sessionID
+                  ? { error: error?.message || "Session error occurred" }
+                  : {}),
+              }))
+              if (useSessions.getState().currentSession?.id === sessionID) {
+                useSessions.getState().refreshMessages()
+              }
+              notify({
+                category: "errors",
+                title: "Session error",
+                body: sanitizeBody(error?.message, "Something went wrong"),
+                sessionId: sessionID,
+              })
+              break
+            }
+
+            case "permission.asked":
+            case "permission.v2.asked": {
+              const req = normalizePermissionEvent({ type, properties: props })
+              if (!req) break
+              const existing = get().permissions[req.sessionID] || []
+              if (existing.some((item) => item.id === req.id)) break
+              set((state) => ({
+                permissions: {
+                  ...state.permissions,
+                  [req.sessionID]: mergePendingPermissions(state.permissions[req.sessionID] || [], [req]),
+                },
+              }))
+              notify({
+                category: "permissions",
+                title: "Agent needs approval",
+                body: sanitizeBody(
+                  req.permission
+                    ? req.patterns?.length
+                      ? `${req.permission}: ${req.patterns.join(", ")}`
+                      : req.permission
+                    : req.patterns?.join(", "),
+                  "A tool needs your approval",
+                ),
+                sessionId: req.sessionID,
+                dedupeKey: `perm-${req.id}`,
+                dedupeCooldownMs: 60_000,
+              })
+              break
+            }
+
+            case "permission.replied":
+            case "permission.v2.replied": {
+              const sessionID = props.sessionID as string
+              const requestID = props.requestID as string
+              if (!sessionID || !requestID) break
+              set((state) => ({
+                permissions: {
+                  ...state.permissions,
+                  [sessionID]: (state.permissions[sessionID] || []).filter((p) => p.id !== requestID),
+                },
+              }))
+              break
+            }
+
+            case "question.asked": {
+              const req = props as any
+              if (!req.id || !req.sessionID) break
+              const existing = get().questions[req.sessionID] || []
+              if (existing.some((item) => item.id === req.id)) break
+              set((state) => ({
+                questions: {
+                  ...state.questions,
+                  [req.sessionID]: [...(state.questions[req.sessionID] || []), req],
+                },
+              }))
+              notify({
+                category: "questions",
+                title: req.questions?.[0]?.header || "Input needed",
+                body: sanitizeBody(req.questions?.[0]?.question, "The assistant has a question"),
+                sessionId: req.sessionID,
+                dedupeKey: `question-${req.id}`,
+                dedupeCooldownMs: 60_000,
+              })
+              break
+            }
+
+            case "question.replied":
+            case "question.rejected": {
+              const sessionID = props.sessionID as string
+              const requestID = props.requestID as string
+              if (!sessionID || !requestID) break
+              set((state) => ({
+                questions: {
+                  ...state.questions,
+                  [sessionID]: (state.questions[sessionID] || []).filter((q) => q.id !== requestID),
+                },
+              }))
+              break
+            }
+          }
+        }
+
+        scheduleReconnect(new Error("Event stream closed"))
+      } catch (err) {
+        if (isAuthError(err) && !currentController.signal.aborted) {
+          // Bad credentials, not a transient failure — retrying forever just
+          // spams Sentry and drains the battery with zero path to recovery
+          // (issue #76: 309 events / 65 users). Stop and surface a distinct
+          // state instead; the sessions screen offers a link to fix
+          // credentials, which reconnects via connect() once saved.
+          console.warn("[SSE] Authentication failed — stopping reconnect loop:", err)
+          addBreadcrumb({
+            category: "sse",
+            level: "error",
+            message: "auth error - stopped retrying",
+            data: { status: err.status },
+          })
+          track(AnalyticsEvent.ConnectionFailed, { source: "sse", error_class: "unauthorized" })
+          set({ connected: false, transport: "idle", authError: true })
+        } else {
+          scheduleReconnect(err)
+        }
+      } finally {
+        if (token === attemptToken) attemptInFlight = false
+        if (currentController.signal.aborted) {
+          console.log("[SSE] Disconnected (aborted)")
+        }
+      }
+    })()
+  },
+
+  reconnectNow: () => {
+    const connState = useConnections.getState()
+    if (!connState.client) return
+    // Deduplicated resume (#186): a foreground event and a network-restore
+    // event often fire together, and neither may tear down a live stream or
+    // race an attempt already dialling — both would open a second stream and
+    // double-handle every event. Two rescues pierce the dedupe:
+    // - a `live` stream gone stale (no byte for SSE_STALE_LIVE_MS) is a
+    //   half-open socket network-restore must rescue (Finding 3);
+    // - a `connecting` attempt parked past the dial bound with no byte is a
+    //   hung dial; connect() below aborts the old controller, unwinding it
+    //   (Finding 2). A stalled "connecting" with no attempt in flight still
+    //   resumes (attemptInFlight is false once the loop has exited, e.g.
+    //   while a reconnect is waiting out its backoff).
+    const now = Date.now()
+    if (get().transport === "live") {
+      // `live` is only set after a byte arrives, so lastByteAt is non-null
+      // here; a null is treated as fresh (no rescue) — the safe direction.
+      if (lastByteAt === null || now - lastByteAt < SSE_STALE_LIVE_MS) return
+    } else if (attemptInFlight) {
+      const parkedFor = attemptStartedAt === null ? 0 : now - attemptStartedAt
+      if (lastByteAt !== null || parkedFor <= SSE_DIAL_TIMEOUT_MS) return
+    }
+    console.log("[SSE] Resume reconnect — re-establishing event stream")
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    controller?.abort()
+    controller = null
+    // Reset backoff state first: connect() gates its post-reconnect busy
+    // resync on reconnectAttempts > 0, and a foreground resume must resync
+    // even from a previously "stable" (but actually dead) connection — so we
+    // run the resync explicitly below instead.
+    set({ reconnectAttempts: 0, lastDisconnectAt: null, lastDisconnectReason: null })
+    get().connect()
+    void resyncBusySessions()
+    const sessions = useSessions.getState()
+    if (sessions.currentSession) {
+      sessions.refreshMessages()
+      const session = sessions.currentSession
+      const client = session.directory
+        ? connState.clientForDirectory(session.directory) ?? connState.client
+        : connState.client
+      if (client) void refreshPending(client, session.id)
+    }
+  },
+
+  disconnect: () => {
+    console.log("[SSE] Disconnecting")
+    addBreadcrumb({ category: "sse", message: "disconnected" })
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    controller?.abort()
+    controller = null
+    // Invalidate any winding-down loop so its finally can't clear state that
+    // belongs to a later attempt.
+    attemptToken++
+    attemptInFlight = false
+    lastByteAt = null
+    attemptStartedAt = null
+    erroredSessions.clear()
+    abortedSessions.clear()
+    set({
+      connected: false,
+      transport: "idle",
+      authError: false,
+      reconnectAttempts: 0,
+      lastDisconnectAt: null,
+      lastDisconnectReason: null,
+      sessionStatus: {},
+      statusText: {},
+      sessionErrors: {},
+      permissions: {},
+      questions: {},
+    })
+  },
+}))
+
+AppState.addEventListener("change", (state) => {
+  if (state === "active") void refreshAllPending()
+})
+
+// Resume the SSE stream when the network comes back (#186). expo-network
+// reports link state, not internet reachability: `isConnected` covers
+// LAN/Tailscale servers that `isInternetReachable` would call offline, so
+// only `isConnected` is consulted. Only the offline -> online transition
+// resumes; reconnectNow() itself is deduped, so a simultaneous foreground
+// event cannot open a second stream. expo-network is an Expo SDK module, so
+// no @react-native-community/netinfo dependency is needed.
+let wasNetworkConnected: boolean | null = null
+Network.addNetworkStateListener((state) => {
+  const isConnected = state.isConnected ?? false
+  const regained = wasNetworkConnected === false && isConnected
+  wasNetworkConnected = isConnected
+  if (regained) useEvents.getState().reconnectNow()
+})
