@@ -63,6 +63,12 @@ jobs:
           grep -q 'universalApk true' android/app/build.gradle
           echo "OK: generated Android config includes armeabi-v7a + arm64-v8a"
 
+      - name: Disable Sentry source-map upload (no secrets required)
+        # Mirrors build.yml's F-Droid job: sentry.gradle registers an upload
+        # task that calls sentry-cli, which hard-fails the build without
+        # SENTRY_AUTH_TOKEN. This workflow intentionally has no secrets.
+        run: sed -i '/apply from.*sentry.gradle/d' android/app/build.gradle
+
       - name: Local debug signing (no secrets required)
         run: |
           keytool -genkeypair -v -keystore android/app/debug.keystore \

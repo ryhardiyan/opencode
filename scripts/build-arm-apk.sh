@@ -29,6 +29,23 @@ if [[ ! -f android/app/debug.keystore ]]; then
     -dname "CN=Android Debug,O=Android,C=US"
 fi
 
+# sentry.gradle registers a source-map upload task that calls sentry-cli;
+# without SENTRY_AUTH_TOKEN it fails the whole build. Strip it for local
+# secret-free builds and restore the committed file when we are done.
+SENTRY_BACKUP=""
+restore_sentry() {
+  if [[ -n "$SENTRY_BACKUP" ]]; then
+    cp "$SENTRY_BACKUP" android/app/build.gradle
+    rm -f "$SENTRY_BACKUP"
+  fi
+}
+if [[ -z "${SENTRY_AUTH_TOKEN:-}" ]] && grep -q 'apply from.*sentry.gradle' android/app/build.gradle; then
+  SENTRY_BACKUP="$(mktemp)"
+  cp android/app/build.gradle "$SENTRY_BACKUP"
+  sed -i '/apply from.*sentry.gradle/d' android/app/build.gradle
+  trap restore_sentry EXIT
+fi
+
 EXTRA_GRADLE_ARGS=()
 if [[ "${PER_ABI:-0}" == "1" ]]; then
   EXTRA_GRADLE_ARGS+=("-Pandroid.enableAbiSplits=true")
