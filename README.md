@@ -1,4 +1,4 @@
-# OpenCode Mobile
+# OpenCode Mobile KHUSUS ANDROID ARSITEKTUR 32BIT 
 
 **The open-source Android client for the [opencode](https://github.com/sst/opencode) AI coding agent.**
 AI-assisted coding from your phone — Android, via Google Play, F-Droid, or a direct APK.
